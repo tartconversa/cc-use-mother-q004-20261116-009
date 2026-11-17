@@ -39,12 +39,14 @@ class Quality:
         conflicts = [self._scope_key(scope) for scope in scopes if scope["conflict"]]
         missing = [self._scope_key(scope) for scope in scopes if not scope["selected"]]
         retracted = [row["id"] for row in claims if row["state"] == "retracted"]
+        superseded = [row["id"] for row in claims if row["state"] == "superseded"]
         return {"project_key": project_key, "total_claims": len(claims), "states": dict(states),
                 "by_source": {key: dict(value) for key, value in sorted(by_source.items())},
                 "scopes": len(scopes), "conflicts": conflicts, "unselected": missing,
-                "retracted_claim_ids": retracted}
+                "retracted_claim_ids": retracted, "superseded_claim_ids": superseded}
 
     def stale_reviews(self, project_key=None):
+        current_rule = self.service.current_rule_version
         scopes = self.service.scopes(project_key)
         rows = []
         for scope in scopes:
@@ -63,10 +65,15 @@ class Quality:
                 reasons.append("capture_not_current")
             if claim["state"] != "accepted":
                 reasons.append("claim_not_accepted")
+            # 已通过的证据若由旧解析规则产出，则在新规则下必须重新审视。
+            if claim["rule_version"] < current_rule:
+                reasons.append("rule_changed")
             if reasons:
                 rows.append({"claim_id": claim["id"], "scope": self._scope_key(scope),
                              "reasons": reasons, "policy_version": policy["version"],
-                             "capture_policy_version": capture["policy_version"]})
+                             "capture_policy_version": capture["policy_version"],
+                             "rule_version": claim["rule_version"],
+                             "current_rule_version": current_rule})
         return rows
 
     def publication_readiness(self, project_key=None):

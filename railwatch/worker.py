@@ -43,7 +43,8 @@ class Worker:
                                    result.last_modified, at=at)
             return {"status": replay["state"], "job_id": job["id"],
                     "capture_id": replay["capture_id"], "claim_ids": replay["claim_ids"],
-                    "issues": replay["issues"]}
+                    "issues": replay["issues"], "rule_version": replay["rule_version"],
+                    "attempt_id": replay["attempt_id"]}
         except ProductError as error:
             self.schedule.fail(job["id"], owner, error.code, at=at)
             return {"status": "failed", "job_id": job["id"],

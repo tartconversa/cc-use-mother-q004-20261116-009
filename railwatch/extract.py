@@ -6,7 +6,40 @@ from html.parser import HTMLParser
 import json
 import re
 
-from .domain import Claim, ProductError
+from .domain import Claim, ProductError, fingerprint
+
+
+# 解析规则版本：发布方把指标从行内 [RAILCLAIM] 标记迁移到新版 JSON 字段后，
+# 所有提取结果都必须能标识产出它的规则版本，以便离线重处理与溯源。
+RULE_VERSION_V1 = 1
+RULE_VERSION_V2 = 2
+RULE_VERSIONS = (RULE_VERSION_V1, RULE_VERSION_V2)
+DEFAULT_RULE_VERSION = RULE_VERSION_V1
+
+# 每个版本的规则规格摘要；rule_digest 随每次解析尝试落库，规则代码升级时可凭它区分。
+RULE_SPECS = {
+    RULE_VERSION_V1: {
+        "name": "legacy-inline-markers",
+        "markers": ["RAILCLAIM"],
+        "json_fields": ["claims"],
+    },
+    RULE_VERSION_V2: {
+        "name": "railway-indicators-json",
+        "markers": ["RAILCLAIM"],
+        "json_fields": ["railway_indicators", "claims"],
+    },
+}
+
+
+def rule_digest(rule_version):
+    return fingerprint({"rule_version": rule_version, "spec": RULE_SPECS[rule_version]})
+
+
+def require_rule_version(rule_version):
+    if type(rule_version) is not int or rule_version not in RULE_VERSIONS:
+        raise ProductError("invalid_rule_version",
+                           "rule_version must be one of " + ",".join(str(v) for v in RULE_VERSIONS))
+    return rule_version
 
 
 class VisibleText(HTMLParser):
@@ -68,16 +101,22 @@ class Extractor:
             raise ProductError("invalid_json", "publisher text must be a string")
         return value
 
-    def parse(self, capture, policy):
+    def parse(self, capture, policy, rule_version=DEFAULT_RULE_VERSION):
+        require_rule_version(rule_version)
         if capture.media_type == "application/json":
-            return self._structured(capture, policy)
-        return self._marked(capture, policy)
+            return self._structured(capture, policy, rule_version)
+        return self._marked(capture, policy, rule_version)
 
-    def _structured(self, capture, policy):
+    def _structured(self, capture, policy, rule_version):
         data = json.loads(capture.body)
-        claims = data.get("claims")
+        # v2 优先读取新版 railway_indicators 字段；缺失时回退到旧版 claims 数组。
+        # v1 只认旧版 claims 数组，因此同一原文在两个规则版本下可以得到不同结果。
+        if rule_version >= RULE_VERSION_V2 and isinstance(data.get("railway_indicators"), list):
+            field, claims = "railway_indicators", data["railway_indicators"]
+        else:
+            field, claims = "claims", data.get("claims")
         if not isinstance(claims, list):
-            raise ProductError("missing_claims", "publisher JSON requires claims array")
+            raise ProductError("missing_claims", "publisher JSON requires " + field + " array")
         result, issues, seen = [], [], set()
         for index, item in enumerate(claims):
             location = f"claims[{index}]"
@@ -97,7 +136,7 @@ class Extractor:
             result.append(claim)
         return result, issues
 
-    def _marked(self, capture, policy):
+    def _marked(self, capture, policy, rule_version):
         """铁路新闻证据系统：Read explicit local evidence markers without inferring dates or amounts from prose."""
         body = self.visible_text(capture)
         lines = [line.strip() for line in body.splitlines() if line.strip()]
@@ -141,8 +180,9 @@ class Extractor:
         if len(claim.quote) < 8:
             raise ProductError("short_quote", "source quote is too short to audit")
 
-    def inspect(self, capture, policy):
-        claims, issues = self.parse(capture, policy)
+    def inspect(self, capture, policy, rule_version=DEFAULT_RULE_VERSION):
+        require_rule_version(rule_version)
+        claims, issues = self.parse(capture, policy, rule_version)
         if not claims and not issues:
             issues.append(ExtractionIssue("no_claims", "body", "no explicit claim evidence found"))
         if len(claims) > 1000:

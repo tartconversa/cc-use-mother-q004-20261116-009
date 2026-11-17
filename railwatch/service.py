@@ -6,16 +6,18 @@ from decimal import Decimal
 import json
 
 from .domain import Capture, Claim, ProductError, SourcePolicy, fingerprint, token
-from .extract import Extractor
+from .extract import (DEFAULT_RULE_VERSION, Extractor, require_rule_version, rule_digest)
 from .schedule import Schedule
 from .store import Store
 
 
 class RailwayService:
-    def __init__(self, db_path):
+    def __init__(self, db_path, current_rule_version=DEFAULT_RULE_VERSION):
+        require_rule_version(current_rule_version)
         self.store = Store(db_path)
         self.schedule = Schedule(self.store)
         self.extractor = Extractor()
+        self.current_rule_version = current_rule_version
 
     def register_source(self, data, expected_version=None):
         policy = SourcePolicy.parse(data)
@@ -33,18 +35,78 @@ class RailwayService:
         existing = self.store.capture_identity(capture.source_id, capture.external_id)
         same = next((row for row in existing if row["content_hash"] == capture.content_hash()), None)
         if same:
+            latest = self.store.latest_parse_attempt(same["id"])
             return {"capture_id": same["id"], "created": False, "state": same["state"],
-                    "claim_ids": [c["id"] for c in self.store.claims_for_capture(same["id"])], "issues": []}
-        claims, issues = self.extractor.inspect(capture, policy)
+                    "claim_ids": [c["id"] for c in self.store.claims_for_capture(same["id"])],
+                    "issues": [], "rule_version": latest["rule_version"] if latest else None,
+                    "attempt_id": latest["id"] if latest else None,
+                    "idempotent": True, "changed": False}
         capture_id, created = self.store.put_capture(capture, policy)
-        if issues and not claims:
-            self.store.set_capture_state(capture_id, "received", "quarantined", {"issues": issues})
-            return {"capture_id": capture_id, "created": created, "state": "quarantined", "claim_ids": [], "issues": issues}
-        if issues:
-            self.store.set_capture_state(capture_id, "received", "quarantined", {"issues": issues})
-            return {"capture_id": capture_id, "created": created, "state": "quarantined", "claim_ids": [], "issues": issues}
-        claim_ids = self.store.insert_claims(capture_id, claims)
-        return {"capture_id": capture_id, "created": created, "state": "parsed", "claim_ids": claim_ids, "issues": []}
+        return self._extract(capture_id, capture, policy, self.current_rule_version, trigger="ingest",
+                             created=created)
+
+    def _extract(self, capture_id, capture, policy, rule_version, trigger, created=True):
+        """对已入库原文执行一次解析并落库解析尝试；只使用本地原文，不发起任何网络请求。"""
+        claims, issues = self.extractor.inspect(capture, policy, rule_version)
+        status = "parsed" if claims and not issues else "quarantined"
+        result_hash = fingerprint({
+            "rule_version": rule_version,
+            "claims": [claim.__dict__ for claim in claims],
+            "issues": issues,
+        })
+        record = self.store.record_parse_attempt(
+            capture_id, rule_version, rule_digest(rule_version), status, result_hash,
+            claims, issues, trigger)
+        return {"capture_id": capture_id, "created": created, "state": record["state"],
+                "claim_ids": record["claim_ids"], "issues": issues,
+                "rule_version": rule_version, "attempt_id": record["attempt_id"],
+                "idempotent": record["idempotent"], "changed": record["changed"]}
+
+    @staticmethod
+    def _stored_capture(row):
+        return Capture(row["source_id"], row["external_id"], row["url"], row["fetched_at"],
+                       row["published_at"], row["title"], row["body"], row["media_type"],
+                       row["metadata"])
+
+    def reprocess(self, capture_id, rule_version=None, trigger="manual"):
+        """用指定规则版本离线重新解析已保存原文；同一版本重复处理幂等。"""
+        rule_version = self.current_rule_version if rule_version is None else require_rule_version(rule_version)
+        row = self.store.capture(capture_id)
+        existing = self.store.get_parse_attempt(capture_id, rule_version)
+        if existing is not None:
+            # 同版本已处理：直接回放当时结果，既不重新解析站点，也不重复落库。
+            return {"capture_id": capture_id, "created": False, "state": existing["status"],
+                    "claim_ids": [c["id"] for c in self.store.claims_for_capture(capture_id)
+                                  if c["parse_attempt_id"] == existing["id"]],
+                    "issues": existing["issues"],
+                    "rule_version": rule_version, "attempt_id": existing["id"],
+                    "idempotent": True, "changed": False}
+        capture = self._stored_capture(row)
+        policy = self.policy(capture.source_id)
+        return self._extract(capture_id, capture, policy, rule_version, trigger, created=False)
+
+    def reprocess_pending(self, rule_version=None, limit=500):
+        """批量离线重处理所有缺少指定版本解析尝试的现存原文。
+
+        处理过程中新入库的原文不会被本轮捞起（清单在开始时一次性确定），
+        避免“处理中新增抓取”造成无限循环或重复处理。
+        """
+        rule_version = self.current_rule_version if rule_version is None else require_rule_version(rule_version)
+        pending = self.store.captures_pending_rule(rule_version, limit)
+        selected_ids = [row["id"] for row in pending]
+        outcomes = []
+        for capture_id in selected_ids:
+            outcomes.append(self.reprocess(capture_id, rule_version, trigger="batch_reprocess"))
+        return {"rule_version": rule_version, "requested_limit": limit,
+                "selected": len(selected_ids), "processed": len(outcomes), "outcomes": outcomes}
+
+    def parse_attempts(self, capture_id):
+        self.store.capture(capture_id)
+        return self.store.parse_attempts(capture_id)
+
+    def claim_reviews(self, claim_id):
+        self.store.claim(claim_id)
+        return self.store.claim_reviews(claim_id)
 
     def capture(self, capture_id):
         row = self.store.capture(capture_id)
@@ -52,7 +114,7 @@ class RailwayService:
         return row
 
     def review_queue(self, project_key=None, state="proposed", limit=100):
-        if state not in {"proposed", "accepted", "rejected", "hold", "retracted"}:
+        if state not in {"proposed", "accepted", "rejected", "hold", "retracted", "superseded"}:
             raise ProductError("invalid_state", "unsupported review state")
         if type(limit) is not int or not 1 <= limit <= 500:
             raise ProductError("invalid_limit", "limit must be 1..500")

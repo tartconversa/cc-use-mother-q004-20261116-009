@@ -31,9 +31,18 @@ CREATE TABLE IF NOT EXISTS claims (
  project_key TEXT NOT NULL, kind TEXT NOT NULL, metric TEXT NOT NULL,
  period TEXT NOT NULL, amount TEXT, unit TEXT, milestone TEXT, quote TEXT NOT NULL,
  claim_hash TEXT NOT NULL, state TEXT NOT NULL, created_at TEXT NOT NULL,
+ rule_version INTEGER NOT NULL DEFAULT 1, parse_attempt_id INTEGER,
  UNIQUE(capture_id,claim_hash)
 );
 CREATE INDEX IF NOT EXISTS claims_scope ON claims(project_key,kind,metric,period);
+CREATE TABLE IF NOT EXISTS parse_attempts (
+ id INTEGER PRIMARY KEY, capture_id INTEGER NOT NULL REFERENCES captures(id),
+ rule_version INTEGER NOT NULL, rule_digest TEXT NOT NULL,
+ status TEXT NOT NULL, result_hash TEXT, claim_count INTEGER NOT NULL DEFAULT 0,
+ issues_json TEXT NOT NULL, trigger TEXT NOT NULL, created_at TEXT NOT NULL,
+ UNIQUE(capture_id,rule_version)
+);
+CREATE INDEX IF NOT EXISTS parse_attempts_capture ON parse_attempts(capture_id,id);
 CREATE TABLE IF NOT EXISTS reviews (
  id INTEGER PRIMARY KEY, claim_id INTEGER NOT NULL REFERENCES claims(id),
  decision TEXT NOT NULL, reviewer TEXT NOT NULL, reason TEXT NOT NULL,
@@ -79,6 +88,17 @@ class Store:
     def initialize(self):
         with closing(self.connect()) as db:
             db.executescript(SCHEMA)
+            self._migrate(db)
+
+    @staticmethod
+    def _migrate(db):
+        # 旧库在 parse_attempts 引入前已有 claims 行；用幂等 ALTER 补齐规则版本列，
+        # 历史主张统一视为规则 v1 的产物，保证升级不丢数据、可重复执行。
+        existing = {row["name"] for row in db.execute("PRAGMA table_info(claims)").fetchall()}
+        if "rule_version" not in existing:
+            db.execute("ALTER TABLE claims ADD COLUMN rule_version INTEGER NOT NULL DEFAULT 1")
+        if "parse_attempt_id" not in existing:
+            db.execute("ALTER TABLE claims ADD COLUMN parse_attempt_id INTEGER")
 
     @contextmanager
     def transaction(self):
@@ -182,20 +202,118 @@ class Store:
                 raise ProductError("capture_state", "capture state changed", 409)
             self.audit(db, "capture_" + target, str(capture_id), detail)
 
-    def insert_claims(self, capture_id, claims):
-        inserted = []
+    def get_parse_attempt(self, capture_id, rule_version):
+        row = self.one("SELECT * FROM parse_attempts WHERE capture_id=? AND rule_version=?",
+                       (capture_id, rule_version))
+        if row is not None:
+            row["issues"] = json.loads(row.pop("issues_json"))
+        return row
+
+    def parse_attempts(self, capture_id):
+        rows = self.all("SELECT * FROM parse_attempts WHERE capture_id=? ORDER BY id", (capture_id,))
+        for row in rows:
+            row["issues"] = json.loads(row.pop("issues_json"))
+        return rows
+
+    def latest_parse_attempt(self, capture_id):
+        row = self.one("SELECT * FROM parse_attempts WHERE capture_id=? ORDER BY id DESC LIMIT 1",
+                       (capture_id,))
+        if row is not None:
+            row["issues"] = json.loads(row.pop("issues_json"))
+        return row
+
+    def captures_pending_rule(self, rule_version, limit=500):
+        """需要用指定规则版本处理的现存原文：不含已废弃版本，且该版本尚无解析尝试。
+
+        同一正文不会因曾被旧规则解析过而被跳过——是否需要处理只由
+        (capture, rule_version) 的尝试记录决定。
+        """
+        if type(limit) is not int or not 1 <= limit <= 10000:
+            raise ProductError("invalid_limit", "limit must be 1..10000")
+        return self.all(
+            "SELECT c.* FROM captures c WHERE c.state!='superseded' AND NOT EXISTS ("
+            "SELECT 1 FROM parse_attempts p WHERE p.capture_id=c.id AND p.rule_version=?) "
+            "ORDER BY c.id LIMIT ?", (rule_version, limit))
+
+    def record_parse_attempt(self, capture_id, rule_version, rule_digest_value, status,
+                             result_hash, claims, issues, trigger):
+        """幂等落库一次解析尝试：同 (capture, rule_version) 已存在则原样返回，不改任何状态。
+
+        成功且结果与当前活跃主张不同：仅淘汰真正变化的主张，引用它的范围回到未解决；
+        未变化的主张沿用原行（保留人工审核结论），新主张以 proposed 进入审核队列。
+        人工复核历史与发布快照不受影响，且不会违反 (capture, claim_hash) 唯一约束。
+        """
         with self.transaction() as db:
+            existing = db.execute("SELECT * FROM parse_attempts WHERE capture_id=? AND rule_version=?",
+                                  (capture_id, rule_version)).fetchone()
+            if existing:
+                return {"attempt_id": existing["id"], "idempotent": True, "changed": False,
+                        "state": existing["status"],
+                        "claim_ids": [row["id"] for row in db.execute(
+                            "SELECT id FROM claims WHERE parse_attempt_id=? ORDER BY id",
+                            (existing["id"],)).fetchall()]}
             row = db.execute("SELECT state FROM captures WHERE id=?", (capture_id,)).fetchone()
-            if row is None or row["state"] != "received":
-                raise ProductError("capture_state", "capture is not ready for extraction", 409)
-            for claim in claims:
-                cursor = db.execute("INSERT INTO claims(capture_id,project_key,kind,metric,period,amount,unit,milestone,quote,claim_hash,state,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                                    (capture_id, claim.project_key, claim.kind, claim.metric, claim.period,
-                                     claim.amount, claim.unit, claim.milestone, claim.quote, claim.hash(), "proposed", now()))
-                inserted.append(cursor.lastrowid)
-            db.execute("UPDATE captures SET state='parsed' WHERE id=?", (capture_id,))
-            self.audit(db, "capture_parsed", str(capture_id), {"claim_ids": inserted})
-        return inserted
+            if row is None:
+                raise ProductError("unknown_capture", "capture does not exist", 404)
+            if row["state"] == "superseded":
+                raise ProductError("capture_state", "superseded captures cannot be reprocessed", 409)
+            cursor = db.execute(
+                "INSERT INTO parse_attempts(capture_id,rule_version,rule_digest,status,result_hash,"
+                "claim_count,issues_json,trigger,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (capture_id, rule_version, rule_digest_value, status, result_hash,
+                 len(claims), canonical(issues), trigger, now()))
+            attempt_id = cursor.lastrowid
+            active = db.execute(
+                "SELECT id,claim_hash FROM claims WHERE capture_id=? AND state!='superseded'",
+                (capture_id,)).fetchall()
+            active_by_hash = {r["claim_hash"]: r["id"] for r in active}
+            new_hashes = {claim.hash() for claim in claims}
+            changed = bool(active) and (status != "parsed"
+                                        or set(active_by_hash) != new_hashes)
+            inserted_claims, kept_claims, retired_claims = [], [], []
+            if status == "parsed":
+                # 淘汰本次结果中已消失的旧主张；仍然存在的主张保留原行与审核状态。
+                for claim_hash, claim_id in active_by_hash.items():
+                    if claim_hash in new_hashes:
+                        kept_claims.append(claim_id)
+                    else:
+                        retired_claims.append(claim_id)
+                        db.execute(
+                            "UPDATE scopes SET selected_claim=NULL,conflict=1,version=version+1,updated_at=? "
+                            "WHERE selected_claim=?", (now(), claim_id))
+                        db.execute("UPDATE claims SET state='superseded' WHERE id=?", (claim_id,))
+                if retired_claims:
+                    self.audit(db, "claims_superseded_by_rule", str(capture_id),
+                               {"rule_version": rule_version, "claim_ids": retired_claims})
+                for claim in claims:
+                    if claim.hash() in active_by_hash:
+                        continue  # 沿用未变化的主张行，避免唯一约束冲突、保留审核结论。
+                    claim_cursor = db.execute(
+                        "INSERT INTO claims(capture_id,project_key,kind,metric,period,amount,unit,milestone,"
+                        "quote,claim_hash,state,created_at,rule_version,parse_attempt_id) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (capture_id, claim.project_key, claim.kind, claim.metric, claim.period,
+                         claim.amount, claim.unit, claim.milestone, claim.quote, claim.hash(),
+                         "proposed", now(), rule_version, attempt_id))
+                    inserted_claims.append(claim_cursor.lastrowid)
+            elif changed:
+                # 解析失败（隔离）：所有当前活跃主张都失去依据，范围回到未解决。
+                for claim_row in active:
+                    db.execute(
+                        "UPDATE scopes SET selected_claim=NULL,conflict=1,version=version+1,updated_at=? "
+                        "WHERE selected_claim=?", (now(), claim_row["id"]))
+                    db.execute("UPDATE claims SET state='superseded' WHERE id=?", (claim_row["id"],))
+                self.audit(db, "claims_superseded_by_rule", str(capture_id),
+                           {"rule_version": rule_version, "claim_ids": [r["id"] for r in active]})
+            db.execute("UPDATE captures SET state=? WHERE id=?", (status, capture_id))
+            self.audit(db, "parse_attempt_recorded", str(capture_id),
+                       {"attempt_id": attempt_id, "rule_version": rule_version, "status": status,
+                        "trigger": trigger, "changed": changed, "issue_count": len(issues)})
+        return {"attempt_id": attempt_id, "idempotent": False, "changed": changed,
+                "state": status, "claim_ids": sorted(inserted_claims + kept_claims)}
+
+    def claim_reviews(self, claim_id):
+        return self.all("SELECT * FROM reviews WHERE claim_id=? ORDER BY id", (claim_id,))
 
     def claim(self, claim_id):
         row = self.one("SELECT * FROM claims WHERE id=?", (claim_id,))

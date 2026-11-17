@@ -61,6 +61,16 @@ class BatchInput(StrictModel):
     stop_on_error: bool = False
 
 
+class ReprocessInput(StrictModel):
+    rule_version: int | None = None
+    trigger: str = "manual"
+
+
+class ReprocessBatchInput(StrictModel):
+    rule_version: int | None = None
+    limit: int = 500
+
+
 def create_app(db_path=None):
     db_path = db_path or os.environ.get("RAILWATCH_DB", "/tmp/railwatch.sqlite3")
     service = RailwayService(db_path)
@@ -109,9 +119,25 @@ def create_app(db_path=None):
                     break
         return {"received": len(body.captures), "processed": len(results), "results": results}
 
+    @app.post("/captures/reprocess-pending")
+    def reprocess_pending(body: ReprocessBatchInput):
+        return service.reprocess_pending(body.rule_version, body.limit)
+
     @app.get("/captures/{capture_id}")
     def get_capture(capture_id: int):
         return service.capture(capture_id)
+
+    @app.post("/captures/{capture_id}/reprocess")
+    def reprocess_capture(capture_id: int, body: ReprocessInput):
+        return service.reprocess(capture_id, body.rule_version, body.trigger)
+
+    @app.get("/captures/{capture_id}/parse-attempts")
+    def get_parse_attempts(capture_id: int):
+        return service.parse_attempts(capture_id)
+
+    @app.get("/claims/{claim_id}/reviews")
+    def get_claim_reviews(claim_id: int):
+        return service.claim_reviews(claim_id)
 
     @app.get("/captures")
     def list_captures(source_id: str | None = None, state: str | None = None,

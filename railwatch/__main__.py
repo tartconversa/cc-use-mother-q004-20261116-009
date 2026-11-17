@@ -29,6 +29,17 @@ def parser():
     snapshot = commands.add_parser("snapshot")
     snapshot.add_argument("name")
     snapshot.add_argument("--project-key")
+    reprocess = commands.add_parser("reprocess")
+    reprocess.add_argument("capture_id", type=int)
+    reprocess.add_argument("--rule-version", type=int)
+    reprocess.add_argument("--trigger", default="manual")
+    reprocess_pending = commands.add_parser("reprocess-pending")
+    reprocess_pending.add_argument("--rule-version", type=int)
+    reprocess_pending.add_argument("--limit", type=int, default=500)
+    attempts = commands.add_parser("attempts")
+    attempts.add_argument("capture_id", type=int)
+    review_history = commands.add_parser("review-history")
+    review_history.add_argument("claim_id", type=int)
     show = commands.add_parser("show")
     show.add_argument("kind", choices=["scopes", "audit", "claims", "snapshot"])
     show.add_argument("--id", type=int)
@@ -49,6 +60,14 @@ def execute(args):
         return service.review(args.claim_id, json.loads(args.decision_json))
     if args.command == "snapshot":
         return service.publish({"name": args.name, "project_key": args.project_key})
+    if args.command == "reprocess":
+        return service.reprocess(args.capture_id, args.rule_version, args.trigger)
+    if args.command == "reprocess-pending":
+        return service.reprocess_pending(args.rule_version, args.limit)
+    if args.command == "attempts":
+        return service.parse_attempts(args.capture_id)
+    if args.command == "review-history":
+        return service.claim_reviews(args.claim_id)
     if args.kind == "scopes":
         return service.scopes(args.project_key)
     if args.kind == "audit":
